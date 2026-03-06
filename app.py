@@ -125,6 +125,16 @@ async def healthz():
     return {"ok": True}
 
 
+@app.get("/status")
+def status():
+    return "ok"
+
+
+@app.get("/health")
+def health():
+    return "ok"
+
+
 @app.post("/webhook/pagerduty")
 async def pagerduty_webhook(
     request: Request,
