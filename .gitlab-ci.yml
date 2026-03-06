@@ -1,0 +1,59 @@
+services:
+  - docker:stable-dind
+
+variables:
+  CONTAINER_PREF: scorum/devops-gitlab-contrib-report
+  # for docker:stable-dind
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+before_script:
+  - apk add git curl || true
+  - export COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y%m%d $CI_COMMIT_SHA)
+  - export DOCKER_IMAGE_TAG="$CI_COMMIT_REF_SLUG-$COMMIT_DATE-$CI_PIPELINE_ID"
+  - export DOCKER_IMAGE="$CONTAINER_PREF:$DOCKER_IMAGE_TAG"
+
+stages:
+  - Build and Validate
+  - Build and Store
+  - Cleanup
+
+Build:
+  stage: Build and Validate
+  script:
+    - docker login -u $DOCKER_USER -p $DOCKER_SECRET
+    - docker build --no-cache --build-arg CI_PIPELINE_ID=$CI_PIPELINE_ID --tag $DOCKER_IMAGE .
+    - docker run --rm $DOCKER_IMAGE python --version
+  after_script:
+    - docker logout
+  tags:
+    - docker
+  except:
+    - master
+
+Build and Store:
+  stage: Build and Store
+  script:
+    - docker login -u $DOCKER_USER -p $DOCKER_SECRET
+    - docker build --no-cache --build-arg CI_PIPELINE_ID=$CI_PIPELINE_ID --tag $DOCKER_IMAGE --tag $CONTAINER_PREF:latest .
+    - docker run --rm $DOCKER_IMAGE python --version
+    - docker tag $DOCKER_IMAGE $CONTAINER_PREF:latest
+    - docker push $DOCKER_IMAGE && docker push $CONTAINER_PREF:latest
+    - |
+      curl $SLACK_ENDPOINT -X POST -H 'Content-type: application/json; charset=utf-8' \
+      --data "{\"channel\":\"devops-team\", \"text\":\" :fox_face::page_facing_up: image pushed $DOCKER_IMAGE\"}"
+  after_script:
+    - docker logout
+  tags:
+    - docker
+  only:
+    - master
+
+Cleanup:
+  stage: Cleanup
+  script:
+    - docker rmi $DOCKER_IMAGE $CONTAINER_PREF:latest --force
+    # removing intermediate images in multi-stage builds
+    - docker image prune -f --filter label=intermediate=$CI_PIPELINE_ID
+  tags:
+    - docker
