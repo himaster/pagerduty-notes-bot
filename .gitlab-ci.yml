@@ -2,7 +2,7 @@ services:
   - docker:stable-dind
 
 variables:
-  CONTAINER_PREF: scorum/devops-gitlab-contrib-report
+  CONTAINER_PREF: scorum/devops-pagerduty-notes-bot
   # for docker:stable-dind
   DOCKER_DRIVER: overlay2
   DOCKER_TLS_CERTDIR: "/certs"
