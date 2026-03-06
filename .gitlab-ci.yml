@@ -29,7 +29,7 @@ Build:
   tags:
     - docker
   except:
-    - master
+    - main
 
 Build and Store:
   stage: Build and Store
@@ -47,7 +47,7 @@ Build and Store:
   tags:
     - docker
   only:
-    - master
+    - main
 
 Cleanup:
   stage: Cleanup
