@@ -68,7 +68,6 @@ def pd_headers() -> Dict[str, str]:
 
 
 async def pd_get_first_alert(incident_id: str) -> Optional[Dict[str, Any]]:
-    # берём первый alert, чтобы вытащить details/links (contexts)
     url = f"{PD_API_BASE}/incidents/{incident_id}/alerts"
     params = {"limit": 1, "offset": 0}
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -98,10 +97,15 @@ def extract_links(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
     for c in contexts:
         if not isinstance(c, dict):
             continue
-        # PD обычно кладёт ссылки как контексты типа "link"
-        if c.get("type") == "link" and c.get("href"):
-            text = c.get("text") or c.get("subject") or c.get("name") or "link"
-            links.append((str(text), str(c["href"])))
+        # PD: type "link" with href; some integrations use "anchor" or put URL in "url"
+        href = c.get("href") or c.get("url")
+        if not href or not isinstance(href, str):
+            continue
+        link_type = c.get("type")
+        if link_type not in ("link", "anchor", None):
+            continue
+        text = c.get("text") or c.get("subject") or c.get("name") or "link"
+        links.append((str(text), str(href)))
     return links
 
 
