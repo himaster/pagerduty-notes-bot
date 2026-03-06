@@ -1,3 +1,4 @@
+import logging
 import os
 import hmac
 import hashlib
@@ -6,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 PD_API_BASE = "https://api.pagerduty.com"
 
@@ -17,6 +20,20 @@ PD_WEBHOOK_SECRET = os.environ["PD_WEBHOOK_SECRET"]  # signing secret (Generic W
 DEDUP_ENABLED = os.getenv("DEDUP_ENABLED", "true").lower() == "true"
 
 app = FastAPI(title="pagerduty-slack-thread-enricher", version="1.0.0")
+
+
+@app.exception_handler(HTTPException)
+async def log_http_exception(request: Request, exc: HTTPException):
+    """Log HTTPException detail so 4xx/5xx errors are visible in logs."""
+    level = logging.ERROR if exc.status_code >= 500 else logging.WARNING
+    logger.log(
+        level,
+        "HTTPException path=%s status=%s detail=%s",
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 def _parse_pd_signatures(header_value: str) -> List[Tuple[str, str]]:
