@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import hmac
@@ -18,6 +19,10 @@ PD_WEBHOOK_SECRET = os.environ["PD_WEBHOOK_SECRET"]  # signing secret (Generic W
 
 # опционально: чтобы не спамить нотами на ретраях
 DEDUP_ENABLED = os.getenv("DEDUP_ENABLED", "true").lower() == "true"
+
+# Debug logging flags (enable temporarily in prod)
+LOG_WEBHOOK_JSON = os.getenv("LOG_WEBHOOK_JSON", "false").lower() == "true"
+LOG_ALERT_JSON = os.getenv("LOG_ALERT_JSON", "false").lower() == "true"
 
 app = FastAPI(title="pagerduty-slack-thread-enricher", version="1.0.0")
 
@@ -79,6 +84,16 @@ async def pd_get_first_alert(incident_id: str) -> Optional[Dict[str, Any]]:
         return alerts[0] if alerts else None
 
 
+def extract_tags(alert: Dict[str, Any]) -> List[Any]:
+    """Get tags array from alert (body.details.tags or body.tags)."""
+    body = (alert or {}).get("body") or {}
+    details = body.get("details") or {}
+    tags = details.get("tags") or body.get("tags")
+    if not isinstance(tags, list):
+        return []
+    return tags
+
+
 def extract_check_name(alert: Dict[str, Any]) -> Optional[str]:
     body = (alert or {}).get("body") or {}
     details = body.get("details") or {}
@@ -109,26 +124,30 @@ def extract_links(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
     return links
 
 
+def _format_tag(tag: Any) -> str:
+    if isinstance(tag, str):
+        return tag
+    if isinstance(tag, dict):
+        return " ".join(f"{k}={v}" for k, v in sorted(tag.items()))
+    return str(tag)
+
+
 def build_note_content(
-    incident_html_url: Optional[str],
-    incident_title: Optional[str],
     check_name: Optional[str],
+    tags: List[Any],
     links: List[Tuple[str, str]],
 ) -> str:
     lines: List[str] = []
-    lines.append("Auto-enrichment (from PagerDuty data)")
-    if incident_title:
-        lines.append(f"Title: {incident_title}")
-    if incident_html_url:
-        lines.append(f"Incident: {incident_html_url}")
+    if tags:
+        lines.append("Tags:")
+        for tag in tags:
+            lines.append(f"- {_format_tag(tag)}")
     if check_name:
         lines.append(f"check_name: {check_name}")
-
     if links:
         lines.append("Links:")
         for text, href in links:
             lines.append(f"- {text}: {href}")
-
     return "\n".join(lines)
 
 
@@ -168,6 +187,8 @@ async def pagerduty_webhook(
         raise HTTPException(status_code=401, detail="Bad webhook signature")
 
     payload = await request.json()
+    if LOG_WEBHOOK_JSON:
+        logger.info("PagerDuty webhook payload:\n%s", json.dumps(payload, ensure_ascii=False, indent=2))
     event = (payload or {}).get("event") or {}
     event_type = event.get("event_type")
 
@@ -177,8 +198,6 @@ async def pagerduty_webhook(
 
     incident = (event.get("data") or {})
     incident_id = incident.get("id")
-    incident_html_url = incident.get("html_url")
-    incident_title = incident.get("title")
 
     if not incident_id:
         raise HTTPException(status_code=400, detail="No incident id in payload")
@@ -191,10 +210,13 @@ async def pagerduty_webhook(
         pass
 
     alert = await pd_get_first_alert(incident_id)
+    if LOG_ALERT_JSON:
+        logger.info("PagerDuty first alert (incident_id=%s):\n%s", incident_id, json.dumps(alert, ensure_ascii=False, indent=2))
     check_name = extract_check_name(alert or {})
+    tags = extract_tags(alert or {})
     links = extract_links(alert or {})
 
-    content = build_note_content(incident_html_url, incident_title, check_name, links)
+    content = build_note_content(check_name, tags, links)
     await pd_create_note(incident_id, content)
 
     return {"ok": True, "incident_id": incident_id, "check_name": check_name, "links": len(links)}
