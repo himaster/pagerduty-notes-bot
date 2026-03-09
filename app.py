@@ -110,6 +110,21 @@ def extract_firing(alert: Dict[str, Any]) -> Optional[str]:
     return "\n".join(lines).strip() or None
 
 
+def extract_links(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
+    links: List[Tuple[str, str]] = []
+    body = (alert or {}).get("body") or {}
+    contexts = body.get("contexts") or []
+    for c in contexts:
+        if not isinstance(c, dict):
+            continue
+        href = c.get("href") or c.get("url")
+        if not href or not isinstance(href, str):
+            continue
+        text = c.get("text") or c.get("subject") or c.get("name") or "link"
+        links.append((str(text), str(href)))
+    return links
+
+
 async def pd_create_note(incident_id: str, content: str) -> None:
     url = f"{PD_API_BASE}/incidents/{incident_id}/notes"
     payload = {"note": {"content": content}}
@@ -173,12 +188,17 @@ async def pagerduty_webhook(
         logger.info("[ALERT_JSON] PagerDuty first alert incident_id=%s:\n%s", incident_id, json.dumps(alert, ensure_ascii=False, indent=2))
     check_name = extract_check_name(alert or {})
     firing = extract_firing(alert or {})
+    links = extract_links(alert or {})
 
     parts: list[str] = []
     if check_name:
         parts.append(f"check_name: {check_name}")
     if firing:
         parts.append(firing)
+    if links:
+        parts.append("Links:")
+        for text, href in links:
+            parts.append(f"- {text}: {href}")
 
     if parts:
         await pd_create_note(incident_id, "\n".join(parts))
