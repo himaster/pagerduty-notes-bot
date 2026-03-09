@@ -9,6 +9,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 PD_API_BASE = "https://api.pagerduty.com"
@@ -84,20 +85,10 @@ async def pd_get_first_alert(incident_id: str) -> Optional[Dict[str, Any]]:
         return alerts[0] if alerts else None
 
 
-def extract_tags(alert: Dict[str, Any]) -> List[Any]:
-    """Get tags array from alert (body.details.tags or body.tags)."""
-    body = (alert or {}).get("body") or {}
-    details = body.get("details") or {}
-    tags = details.get("tags") or body.get("tags")
-    if not isinstance(tags, list):
-        return []
-    return tags
-
-
 def extract_check_name(alert: Dict[str, Any]) -> Optional[str]:
     body = (alert or {}).get("body") or {}
-    details = body.get("details") or {}
-    # частые варианты ключей в кастомных деталях
+    cef = body.get("cef_details") or {}
+    details = cef.get("details") or body.get("details") or {}
     for key in ("check_name", "check", "alertname", "rule", "name"):
         v = details.get(key)
         if isinstance(v, str) and v.strip():
@@ -105,50 +96,18 @@ def extract_check_name(alert: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def extract_links(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
-    links: List[Tuple[str, str]] = []
+def extract_firing(alert: Dict[str, Any]) -> Optional[str]:
     body = (alert or {}).get("body") or {}
-    contexts = body.get("contexts") or []
-    for c in contexts:
-        if not isinstance(c, dict):
-            continue
-        # PD: type "link" with href; some integrations use "anchor" or put URL in "url"
-        href = c.get("href") or c.get("url")
-        if not href or not isinstance(href, str):
-            continue
-        link_type = c.get("type")
-        if link_type not in ("link", "anchor", None):
-            continue
-        text = c.get("text") or c.get("subject") or c.get("name") or "link"
-        links.append((str(text), str(href)))
-    return links
-
-
-def _format_tag(tag: Any) -> str:
-    if isinstance(tag, str):
-        return tag
-    if isinstance(tag, dict):
-        return " ".join(f"{k}={v}" for k, v in sorted(tag.items()))
-    return str(tag)
-
-
-def build_note_content(
-    check_name: Optional[str],
-    tags: List[Any],
-    links: List[Tuple[str, str]],
-) -> str:
-    lines: List[str] = []
-    if tags:
-        lines.append("Tags:")
-        for tag in tags:
-            lines.append(f"- {_format_tag(tag)}")
-    if check_name:
-        lines.append(f"check_name: {check_name}")
-    if links:
-        lines.append("Links:")
-        for text, href in links:
-            lines.append(f"- {text}: {href}")
-    return "\n".join(lines)
+    cef = body.get("cef_details") or {}
+    details = cef.get("details") or {}
+    firing = details.get("firing")
+    if not isinstance(firing, str) or not firing.strip():
+        return None
+    # Drop trailing "Source: ..." line
+    lines = firing.strip().splitlines()
+    while lines and lines[-1].startswith("Source:"):
+        lines.pop()
+    return "\n".join(lines).strip() or None
 
 
 async def pd_create_note(incident_id: str, content: str) -> None:
@@ -188,7 +147,7 @@ async def pagerduty_webhook(
 
     payload = await request.json()
     if LOG_WEBHOOK_JSON:
-        print("[LOG_WEBHOOK_JSON] PagerDuty webhook payload:\n", json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        logger.info("[WEBHOOK_JSON] PagerDuty webhook payload:\n%s", json.dumps(payload, ensure_ascii=False, indent=2))
     event = (payload or {}).get("event") or {}
     event_type = event.get("event_type")
 
@@ -211,12 +170,17 @@ async def pagerduty_webhook(
 
     alert = await pd_get_first_alert(incident_id)
     if LOG_ALERT_JSON:
-        print("[LOG_ALERT_JSON] PagerDuty first alert incident_id=%s:\n" % incident_id, json.dumps(alert, ensure_ascii=False, indent=2), flush=True)
+        logger.info("[ALERT_JSON] PagerDuty first alert incident_id=%s:\n%s", incident_id, json.dumps(alert, ensure_ascii=False, indent=2))
     check_name = extract_check_name(alert or {})
-    tags = extract_tags(alert or {})
-    links = extract_links(alert or {})
+    firing = extract_firing(alert or {})
 
-    content = build_note_content(check_name, tags, links)
-    await pd_create_note(incident_id, content)
+    parts: list[str] = []
+    if check_name:
+        parts.append(f"check_name: {check_name}")
+    if firing:
+        parts.append(firing)
 
-    return {"ok": True, "incident_id": incident_id, "check_name": check_name, "links": len(links)}
+    if parts:
+        await pd_create_note(incident_id, "\n".join(parts))
+
+    return {"ok": True, "incident_id": incident_id}
