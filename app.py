@@ -16,7 +16,9 @@ PD_API_BASE = "https://api.pagerduty.com"
 
 PD_API_TOKEN = os.environ["PD_API_TOKEN"]          # REST API key
 PD_FROM_EMAIL = os.environ["PD_FROM_EMAIL"]        # email существующего PD user
-PD_WEBHOOK_SECRET = os.environ["PD_WEBHOOK_SECRET"]  # signing secret (Generic Webhooks v3)
+PD_WEBHOOK_SECRETS = [
+    s.strip() for s in os.environ["PD_WEBHOOK_SECRET"].split(",") if s.strip()
+]
 
 # опционально: чтобы не спамить нотами на ретраях
 DEDUP_ENABLED = os.getenv("DEDUP_ENABLED", "true").lower() == "true"
@@ -54,13 +56,15 @@ def _parse_pd_signatures(header_value: str) -> List[Tuple[str, str]]:
     return out
 
 
-def verify_webhook_signature(secret: str, raw_body: bytes, signature_header: Optional[str]) -> bool:
+def verify_webhook_signature(secrets: List[str], raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not signature_header:
         return False
-    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    for ver, val in _parse_pd_signatures(signature_header):
-        if ver == "v1" and hmac.compare_digest(val.lower(), digest.lower()):
-            return True
+    sigs = _parse_pd_signatures(signature_header)
+    for secret in secrets:
+        digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        for ver, val in sigs:
+            if ver == "v1" and hmac.compare_digest(val.lower(), digest.lower()):
+                return True
     return False
 
 
@@ -157,7 +161,7 @@ async def pagerduty_webhook(
 ):
     raw = await request.body()
 
-    if not verify_webhook_signature(PD_WEBHOOK_SECRET, raw, x_pagerduty_signature):
+    if not verify_webhook_signature(PD_WEBHOOK_SECRETS, raw, x_pagerduty_signature):
         raise HTTPException(status_code=401, detail="Bad webhook signature")
 
     payload = await request.json()
