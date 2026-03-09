@@ -188,7 +188,7 @@ async def pagerduty_webhook(
 
     payload = await request.json()
     if LOG_WEBHOOK_JSON:
-        logger.info("PagerDuty webhook payload:\n%s", json.dumps(payload, ensure_ascii=False, indent=2))
+        print("[LOG_WEBHOOK_JSON] PagerDuty webhook payload:\n", json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     event = (payload or {}).get("event") or {}
     event_type = event.get("event_type")
 
@@ -211,7 +211,7 @@ async def pagerduty_webhook(
 
     alert = await pd_get_first_alert(incident_id)
     if LOG_ALERT_JSON:
-        logger.info("PagerDuty first alert (incident_id=%s):\n%s", incident_id, json.dumps(alert, ensure_ascii=False, indent=2))
+        print("[LOG_ALERT_JSON] PagerDuty first alert incident_id=%s:\n" % incident_id, json.dumps(alert, ensure_ascii=False, indent=2), flush=True)
     check_name = extract_check_name(alert or {})
     tags = extract_tags(alert or {})
     links = extract_links(alert or {})
