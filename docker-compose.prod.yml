@@ -1,0 +1,20 @@
+services:
+  app:
+    image: ${IMAGE:-pagerduty-notes-bot:latest}
+    restart: always
+    ports: []
+    environment:
+      - LOG_WEBHOOK_JSON=false
+      - LOG_ALERT_JSON=false
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pd-notes-bot.rule=Host(`${TRAEFIK_HOST}`)"
+      - "traefik.http.routers.pd-notes-bot.entrypoints=websecure"
+      - "traefik.http.routers.pd-notes-bot.tls.certresolver=letsencrypt"
+      - "traefik.http.services.pd-notes-bot.loadbalancer.server.port=8080"
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true

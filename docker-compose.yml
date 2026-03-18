@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    container_name: pagerduty-notes-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - LOG_WEBHOOK_JSON=true
+      - LOG_ALERT_JSON=true
