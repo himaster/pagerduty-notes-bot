@@ -114,6 +114,16 @@ def extract_firing(alert: Dict[str, Any]) -> Optional[str]:
     return "\n".join(lines).strip() or None
 
 
+def extract_tags(alert: Dict[str, Any]) -> List[str]:
+    body = (alert or {}).get("body") or {}
+    cef = body.get("cef_details") or {}
+    details = cef.get("details") or body.get("details") or {}
+    tags = details.get("tags")
+    if isinstance(tags, list):
+        return [str(t) for t in tags if t]
+    return []
+
+
 def extract_links(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
     links: List[Tuple[str, str]] = []
     body = (alert or {}).get("body") or {}
@@ -192,11 +202,14 @@ async def pagerduty_webhook(
         logger.info("[ALERT_JSON] PagerDuty first alert incident_id=%s:\n%s", incident_id, json.dumps(alert, ensure_ascii=False, indent=2))
     check_name = extract_check_name(alert or {})
     firing = extract_firing(alert or {})
+    tags = extract_tags(alert or {})
     links = extract_links(alert or {})
 
     parts: list[str] = []
     if check_name:
         parts.append(f"check_name: {check_name}")
+    if tags:
+        parts.append(f"tags: {', '.join(tags)}")
     if firing:
         parts.append(firing)
     if links:
