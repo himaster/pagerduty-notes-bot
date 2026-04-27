@@ -133,15 +133,24 @@ def extract_tags(alert: Dict[str, Any]) -> List[str]:
 PINGDOM_INTEGRATION_TAG_PREFIXES = ("global-integration-", "gb-integration-")
 PINGDOM_INTEGRATION_TEAM_HANDLE = "integration-team"
 
+# Note text appended for each detection case. `{mention}` is replaced with
+# the resolved `<!subteam^...>` syntax just before posting.
+DEFAULT_MENTION_TEMPLATE = "cc {mention}"
+INTEGRATION_TEAM_MENTION_TEMPLATE = (
+    "Наблюдается проблема c интеграцией с партнером, "
+    "проверьте пожалуйста логи и напишите партнеру {mention}"
+)
 
-def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
-    """Return Slack user-group handle from alert labels.
+
+def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Return (Slack user-group handle, mention message template) or None.
 
     Resolution order:
     1. `slack-team` / `slack_team` key in details
     2. tag formatted as `slack-team:foo` / `slack-team=foo`
     3. Pingdom-style integration tag (`global-integration-*` or
-       `gb-integration-*`) -> `integration-team`
+       `gb-integration-*`) -> `integration-team` with a partner-integration
+       message instead of the default `cc` line.
     """
     body = (alert or {}).get("body") or {}
     cef = body.get("cef_details") or {}
@@ -150,7 +159,7 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
     for key in ("slack-team", "slack_team"):
         v = details.get(key)
         if isinstance(v, str) and v.strip():
-            return v.strip().lstrip("@")
+            return v.strip().lstrip("@"), DEFAULT_MENTION_TEMPLATE
 
     tags = details.get("tags")
     if isinstance(tags, list):
@@ -161,7 +170,7 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
                 if sep in t:
                     k, v = t.split(sep, 1)
                     if k.strip().lower() in ("slack-team", "slack_team") and v.strip():
-                        return v.strip().lstrip("@")
+                        return v.strip().lstrip("@"), DEFAULT_MENTION_TEMPLATE
                     break
 
         for t in tags:
@@ -169,7 +178,7 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
                 continue
             tl = t.strip().lower()
             if any(tl.startswith(p) for p in PINGDOM_INTEGRATION_TAG_PREFIXES):
-                return PINGDOM_INTEGRATION_TEAM_HANDLE
+                return PINGDOM_INTEGRATION_TEAM_HANDLE, INTEGRATION_TEAM_MENTION_TEMPLATE
     return None
 
 
@@ -291,17 +300,18 @@ async def pagerduty_webhook(
     firing = extract_firing(alert or {})
     tags = extract_tags(alert or {})
     links = extract_links(alert or {})
-    slack_team = extract_slack_team(alert or {})
+    team_info = extract_slack_team(alert or {})
 
-    slack_mention: Optional[str] = None
-    if slack_team:
-        group_id = await slack_get_usergroup_id(slack_team)
+    slack_message: Optional[str] = None
+    if team_info:
+        handle, template = team_info
+        group_id = await slack_get_usergroup_id(handle)
         if group_id:
-            slack_mention = f"<!subteam^{group_id}>"
+            slack_message = template.format(mention=f"<!subteam^{group_id}>")
         else:
             logger.warning(
                 "Could not resolve Slack team handle '%s' to user-group ID (incident=%s)",
-                slack_team,
+                handle,
                 incident_id,
             )
 
@@ -316,8 +326,8 @@ async def pagerduty_webhook(
         parts.append("Links:")
         for text, href in links:
             parts.append(f"- {text}: {href}")
-    if slack_mention:
-        parts.append(f"cc {slack_mention}")
+    if slack_message:
+        parts.append(slack_message)
 
     if parts:
         await pd_create_note(incident_id, "\n".join(parts))
