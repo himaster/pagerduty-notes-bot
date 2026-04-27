@@ -131,7 +131,7 @@ def extract_tags(alert: Dict[str, Any]) -> List[str]:
 # Pingdom alerts carry plain string tags like "global-integration-aviatrix";
 # any tag with one of these prefixes routes the ping to a fixed handle.
 PINGDOM_INTEGRATION_TAG_PREFIXES = ("global-integration-", "gb-integration-")
-PINGDOM_INTEGRATION_TEAM_HANDLE = "integration-team"
+PINGDOM_INTEGRATION_TEAM_HANDLE = "support-team"
 
 # Note text appended for each detection case. `{mention}` is replaced with
 # the resolved `<!subteam^...>` syntax just before posting.
