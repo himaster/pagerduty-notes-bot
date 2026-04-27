@@ -128,11 +128,20 @@ def extract_tags(alert: Dict[str, Any]) -> List[str]:
     return []
 
 
-def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
-    """Return Slack user-group handle from `slack-team` / `slack_team` label.
+# Pingdom alerts carry plain string tags like "global-integration-aviatrix";
+# any tag with one of these prefixes routes the ping to a fixed handle.
+PINGDOM_INTEGRATION_TAG_PREFIXES = ("global-integration-", "gb-integration-")
+PINGDOM_INTEGRATION_TEAM_HANDLE = "integration-team"
 
-    Looks first at `details` keys directly, then at string tags formatted as
-    `slack-team:foo` or `slack-team=foo`.
+
+def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
+    """Return Slack user-group handle from alert labels.
+
+    Resolution order:
+    1. `slack-team` / `slack_team` key in details
+    2. tag formatted as `slack-team:foo` / `slack-team=foo`
+    3. Pingdom-style integration tag (`global-integration-*` or
+       `gb-integration-*`) -> `integration-team`
     """
     body = (alert or {}).get("body") or {}
     cef = body.get("cef_details") or {}
@@ -154,6 +163,13 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[str]:
                     if k.strip().lower() in ("slack-team", "slack_team") and v.strip():
                         return v.strip().lstrip("@")
                     break
+
+        for t in tags:
+            if not isinstance(t, str):
+                continue
+            tl = t.strip().lower()
+            if any(tl.startswith(p) for p in PINGDOM_INTEGRATION_TAG_PREFIXES):
+                return PINGDOM_INTEGRATION_TEAM_HANDLE
     return None
 
 
