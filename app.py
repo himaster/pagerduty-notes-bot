@@ -131,7 +131,7 @@ def extract_tags(alert: Dict[str, Any]) -> List[str]:
 # Pingdom alerts carry plain string tags like "global-integration-aviatrix";
 # any tag with one of these prefixes routes the ping to a fixed handle.
 PINGDOM_INTEGRATION_TAG_PREFIXES = ("global-integration-", "gb-integration-")
-PINGDOM_INTEGRATION_TEAM_HANDLE = "integration-team"
+PINGDOM_INTEGRATION_TEAM_HANDLE = "support-team"
 
 # Note text appended for each detection case. `{mention}` is replaced with
 # the resolved `<!subteam^...>` syntax just before posting.
@@ -235,6 +235,95 @@ def extract_links(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
     return links
 
 
+# Keys already rendered separately (check_name/tags/firing/slack-team) or
+# known Grafana internals that would just add noise to the note.
+_DETAILS_SKIP_KEYS = {
+    "firing", "tags",
+    "check_name", "check", "alertname", "rule", "name",
+    "slack-team", "slack_team",
+    "__alert_rule_uid__", "__alert_rule_namespace_uid__",
+    "__alerts_url__", "__value_string__", "__values__",
+    "__panelId__", "__dashboardUid__", "orgId",
+    "generatorURL", "grafana_url",
+}
+
+
+def extract_summary(alert: Dict[str, Any]) -> Optional[str]:
+    body = (alert or {}).get("body") or {}
+    cef = body.get("cef_details") or {}
+    # Unified Alerting puts the human-readable title in `summary`; legacy
+    # Grafana dashboard alerts put it in `description` / `message`.
+    for key in ("summary", "description", "message"):
+        v = cef.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def extract_details_kv(alert: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Return remaining (label, value) pairs from alert details.
+
+    Skips keys rendered elsewhere or known to be noisy so that alerts
+    coming via PD Events API v2 (Grafana, generic webhooks, etc.) get
+    all useful labels and annotations surfaced in the PD note.
+    """
+    body = (alert or {}).get("body") or {}
+    cef = body.get("cef_details") or {}
+    details = cef.get("details") or body.get("details") or {}
+    if not isinstance(details, dict):
+        return []
+    out: List[Tuple[str, str]] = []
+    for k, v in details.items():
+        if not isinstance(k, str) or k in _DETAILS_SKIP_KEYS:
+            continue
+        if v is None:
+            continue
+        if isinstance(v, str):
+            rendered = v.strip()
+            if not rendered:
+                continue
+        elif isinstance(v, (dict, list)):
+            try:
+                rendered = json.dumps(v, ensure_ascii=False)
+            except (TypeError, ValueError):
+                rendered = str(v)
+        else:
+            rendered = str(v)
+        out.append((k, rendered))
+    out.sort(key=lambda kv: kv[0].lower())
+    return out
+
+
+def extract_grafana_link(alert: Dict[str, Any]) -> Optional[str]:
+    """Return a Grafana URL surfaced anywhere in the alert payload.
+
+    Lookup order:
+    1. `cef_details.client_url` when `cef_details.client == "Grafana"` —
+       this is where legacy Grafana dashboard alerts put the panel URL,
+       and `contexts` is empty for that integration variant.
+    2. Grafana-internal keys in details (`__alerts_url__`, `generatorURL`,
+       `grafana_url`) — covers Unified Alerting and custom routes.
+    """
+    body = (alert or {}).get("body") or {}
+    cef = body.get("cef_details") or {}
+    client = cef.get("client")
+    client_url = cef.get("client_url")
+    if (
+        isinstance(client, str)
+        and client.strip().lower() == "grafana"
+        and isinstance(client_url, str)
+        and client_url.strip()
+    ):
+        return client_url.strip()
+    details = cef.get("details") or body.get("details") or {}
+    if isinstance(details, dict):
+        for key in ("__alerts_url__", "generatorURL", "grafana_url"):
+            v = details.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
 async def pd_create_note(incident_id: str, content: str) -> None:
     url = f"{PD_API_BASE}/incidents/{incident_id}/notes"
     payload = {"note": {"content": content}}
@@ -322,6 +411,21 @@ async def pagerduty_webhook(
         parts.append(f"tags: {', '.join(tags)}")
     if firing:
         parts.append(firing)
+    else:
+        # Pingdom-specific `firing` block is absent for Grafana / Events API v2
+        # senders, so fall back to surfacing the summary and every remaining
+        # label/annotation from details.
+        summary = extract_summary(alert or {})
+        if summary and summary != check_name:
+            parts.append(summary)
+        detail_pairs = extract_details_kv(alert or {})
+        if detail_pairs:
+            parts.append("Details:")
+            for k, v in detail_pairs:
+                parts.append(f"- {k}: {v}")
+        grafana_link = extract_grafana_link(alert or {})
+        if grafana_link and not any(grafana_link == href for _, href in links):
+            links.append(("Grafana", grafana_link))
     if links:
         parts.append("Links:")
         for text, href in links:
