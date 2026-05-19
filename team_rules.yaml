@@ -27,6 +27,6 @@ rules:
         days: [mon, tue, wed, thu, fri]
         start: "09:00"
         end: "17:30"
-        handle: integration-managers-team
+        handles: [support-team, integration-managers-team]
       off_hours:
-        handle: support-team
+        handles: [support-team]

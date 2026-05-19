@@ -150,20 +150,43 @@ def _parse_hhmm(value: str) -> time:
     return time(int(h), int(m))
 
 
+def _parse_handles(cfg: Dict[str, Any], ctx: str) -> Tuple[str, ...]:
+    """Accept either `handle: str` or `handles: [str, ...]`; return non-empty tuple."""
+    has_one = "handle" in cfg
+    has_many = "handles" in cfg
+    if has_one and has_many:
+        raise ValueError(f"{ctx}: provide either 'handle' or 'handles', not both")
+    if not has_one and not has_many:
+        raise ValueError(f"{ctx}: must provide 'handle' or 'handles'")
+    if has_many:
+        raw = cfg["handles"]
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or not all(isinstance(x, str) and x.strip() for x in raw)
+        ):
+            raise ValueError(f"{ctx}: 'handles' must be a non-empty list of strings")
+        return tuple(x.strip().lstrip("@") for x in raw)
+    raw = cfg["handle"]
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{ctx}: 'handle' must be a non-empty string")
+    return (raw.strip().lstrip("@"),)
+
+
 @dataclass(frozen=True)
 class _Schedule:
     tz: timezone
     days: frozenset
     start: time
     end: time
-    business_handle: str
-    off_hours_handle: str
+    business_handles: Tuple[str, ...]
+    off_hours_handles: Tuple[str, ...]
 
-    def pick_handle(self) -> str:
+    def pick_handles(self) -> Tuple[str, ...]:
         now = datetime.now(self.tz)
         if now.weekday() in self.days and self.start <= now.time() < self.end:
-            return self.business_handle
-        return self.off_hours_handle
+            return self.business_handles
+        return self.off_hours_handles
 
 
 @dataclass(frozen=True)
@@ -173,7 +196,7 @@ class _Rule:
     message: str
     place_at_top: bool
     schedule: Optional[_Schedule]
-    static_handle: Optional[str]
+    static_handles: Optional[Tuple[str, ...]]
 
     def matches(self, tags: List[str]) -> bool:
         for t in tags:
@@ -182,11 +205,11 @@ class _Rule:
                 return True
         return False
 
-    def pick_handle(self) -> str:
+    def pick_handles(self) -> Tuple[str, ...]:
         if self.schedule is not None:
-            return self.schedule.pick_handle()
-        assert self.static_handle is not None
-        return self.static_handle
+            return self.schedule.pick_handles()
+        assert self.static_handles is not None
+        return self.static_handles
 
 
 @dataclass(frozen=True)
@@ -209,8 +232,8 @@ def _load_team_rules(path: str) -> _TeamRules:
         if not isinstance(message, str) or not message.strip():
             raise ValueError(f"team rule {name!r} has empty message")
         sched_cfg = raw.get("schedule")
-        static_handle = raw.get("handle")
         schedule: Optional[_Schedule] = None
+        static_handles: Optional[Tuple[str, ...]] = None
         if sched_cfg:
             bh = sched_cfg.get("business_hours") or {}
             oh = sched_cfg.get("off_hours") or {}
@@ -219,18 +242,18 @@ def _load_team_rules(path: str) -> _TeamRules:
                 days=frozenset(_WEEKDAY_BY_NAME[d.lower()] for d in bh["days"]),
                 start=_parse_hhmm(bh["start"]),
                 end=_parse_hhmm(bh["end"]),
-                business_handle=bh["handle"],
-                off_hours_handle=oh["handle"],
+                business_handles=_parse_handles(bh, f"{name}.schedule.business_hours"),
+                off_hours_handles=_parse_handles(oh, f"{name}.schedule.off_hours"),
             )
-        elif not (isinstance(static_handle, str) and static_handle.strip()):
-            raise ValueError(f"team rule {name!r} needs either `handle` or `schedule`")
+        else:
+            static_handles = _parse_handles(raw, name)
         rules.append(_Rule(
             name=name,
             tag_prefixes=prefixes,
             message=message.strip(),
             place_at_top=bool(raw.get("place_at_top", False)),
             schedule=schedule,
-            static_handle=static_handle if schedule is None else None,
+            static_handles=static_handles,
         ))
     default_message = data.get("default_message") or "cc {mention}"
     return _TeamRules(default_message=default_message, rules=tuple(rules))
@@ -245,8 +268,8 @@ logger.info(
 )
 
 
-def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str, bool]]:
-    """Return (Slack handle, mention message template, place_at_top) or None.
+def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[Tuple[str, ...], str, bool]]:
+    """Return (Slack handles, mention message template, place_at_top) or None.
 
     Resolution order:
     1. `slack-team` / `slack_team` key in details        -> default_message
@@ -260,7 +283,7 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str, bool]]
     for key in ("slack-team", "slack_team"):
         v = details.get(key)
         if isinstance(v, str) and v.strip():
-            return v.strip().lstrip("@"), TEAM_RULES.default_message, False
+            return (v.strip().lstrip("@"),), TEAM_RULES.default_message, False
 
     tags = details.get("tags")
     if not isinstance(tags, list):
@@ -273,13 +296,13 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str, bool]]
             if sep in t:
                 k, v = t.split(sep, 1)
                 if k.strip().lower() in ("slack-team", "slack_team") and v.strip():
-                    return v.strip().lstrip("@"), TEAM_RULES.default_message, False
+                    return (v.strip().lstrip("@"),), TEAM_RULES.default_message, False
                 break
 
     str_tags = [t for t in tags if isinstance(t, str)]
     for rule in TEAM_RULES.rules:
         if rule.matches(str_tags):
-            return rule.pick_handle(), rule.message, rule.place_at_top
+            return rule.pick_handles(), rule.message, rule.place_at_top
     return None
 
 
@@ -495,17 +518,21 @@ async def pagerduty_webhook(
     slack_message: Optional[str] = None
     slack_message_at_top = False
     if team_info:
-        handle, template, place_at_top = team_info
-        group_id = await slack_get_usergroup_id(handle)
-        if group_id:
-            slack_message = template.format(mention=f"<!subteam^{group_id}>")
+        handles, template, place_at_top = team_info
+        resolved: List[str] = []
+        for handle in handles:
+            group_id = await slack_get_usergroup_id(handle)
+            if group_id:
+                resolved.append(f"<!subteam^{group_id}>")
+            else:
+                logger.warning(
+                    "Could not resolve Slack team handle '%s' to user-group ID (incident=%s)",
+                    handle,
+                    incident_id,
+                )
+        if resolved:
+            slack_message = template.format(mention=" ".join(resolved))
             slack_message_at_top = place_at_top
-        else:
-            logger.warning(
-                "Could not resolve Slack team handle '%s' to user-group ID (incident=%s)",
-                handle,
-                incident_id,
-            )
 
     parts: list[str] = []
     if slack_message and slack_message_at_top:
