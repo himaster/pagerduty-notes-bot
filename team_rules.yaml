@@ -1,0 +1,32 @@
+# Slack team-mention routing for PagerDuty notes.
+#
+# Resolution order at runtime (see app.py:extract_slack_team):
+#   1. Alert details key `slack-team` / `slack_team`        -> default_message
+#   2. Tag formatted as `slack-team:foo` / `slack-team=foo` -> default_message
+#   3. First rule below whose `match.tag_prefixes` matches a tag
+#
+# `{mention}` in messages is replaced with `<!subteam^GROUP_ID>` where
+# GROUP_ID is resolved from the Slack handle via usergroups.list.
+#
+# Path can be overridden with TEAM_RULES_CONFIG=/path/to/file.yaml.
+
+default_message: "cc {mention}"
+
+rules:
+  - name: pingdom-integration
+    match:
+      tag_prefixes:
+        - global-integration-
+        - gb-integration-
+    message: |-
+      {mention} Наблюдается проблема c интеграцией с партнером, проверьте пожалуйста логи и напишите партнеру
+    place_at_top: true
+    schedule:
+      business_hours:
+        tz: "+03:00"
+        days: [mon, tue, wed, thu, fri]
+        start: "09:00"
+        end: "17:30"
+        handle: integration-managers-team
+      off_hours:
+        handle: support-team
