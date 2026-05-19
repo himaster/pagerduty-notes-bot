@@ -10,3 +10,5 @@ services:
     environment:
       - LOG_WEBHOOK_JSON=true
       - LOG_ALERT_JSON=true
+    volumes:
+      - ./team_rules.yaml:/app/team_rules.yaml:ro

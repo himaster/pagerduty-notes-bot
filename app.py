@@ -3,9 +3,12 @@ import logging
 import os
 import hmac
 import hashlib
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -128,29 +131,127 @@ def extract_tags(alert: Dict[str, Any]) -> List[str]:
     return []
 
 
-# Pingdom alerts carry plain string tags like "global-integration-aviatrix";
-# any tag with one of these prefixes routes the ping to a fixed handle.
-PINGDOM_INTEGRATION_TAG_PREFIXES = ("global-integration-", "gb-integration-")
-PINGDOM_INTEGRATION_TEAM_HANDLE = "support-team"
+_WEEKDAY_BY_NAME = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+}
 
-# Note text appended for each detection case. `{mention}` is replaced with
-# the resolved `<!subteam^...>` syntax just before posting.
-DEFAULT_MENTION_TEMPLATE = "cc {mention}"
-INTEGRATION_TEAM_MENTION_TEMPLATE = (
-    "Наблюдается проблема c интеграцией с партнером, "
-    "проверьте пожалуйста логи и напишите партнеру {mention}"
+
+def _parse_tz_offset(value: str) -> timezone:
+    """Parse \"+03:00\" / \"-05:30\" into a timezone."""
+    if not isinstance(value, str) or len(value) < 6 or value[0] not in "+-":
+        raise ValueError(f"invalid tz offset: {value!r}")
+    sign = 1 if value[0] == "+" else -1
+    hours, minutes = value[1:].split(":")
+    return timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
+
+
+def _parse_hhmm(value: str) -> time:
+    h, m = value.split(":")
+    return time(int(h), int(m))
+
+
+@dataclass(frozen=True)
+class _Schedule:
+    tz: timezone
+    days: frozenset
+    start: time
+    end: time
+    business_handle: str
+    off_hours_handle: str
+
+    def pick_handle(self) -> str:
+        now = datetime.now(self.tz)
+        if now.weekday() in self.days and self.start <= now.time() < self.end:
+            return self.business_handle
+        return self.off_hours_handle
+
+
+@dataclass(frozen=True)
+class _Rule:
+    name: str
+    tag_prefixes: Tuple[str, ...]
+    message: str
+    place_at_top: bool
+    schedule: Optional[_Schedule]
+    static_handle: Optional[str]
+
+    def matches(self, tags: List[str]) -> bool:
+        for t in tags:
+            tl = t.strip().lower()
+            if any(tl.startswith(p) for p in self.tag_prefixes):
+                return True
+        return False
+
+    def pick_handle(self) -> str:
+        if self.schedule is not None:
+            return self.schedule.pick_handle()
+        assert self.static_handle is not None
+        return self.static_handle
+
+
+@dataclass(frozen=True)
+class _TeamRules:
+    default_message: str
+    rules: Tuple[_Rule, ...]
+
+
+def _load_team_rules(path: str) -> _TeamRules:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    rules: List[_Rule] = []
+    for idx, raw in enumerate(data.get("rules") or []):
+        name = raw.get("name") or f"rule[{idx}]"
+        match = raw.get("match") or {}
+        prefixes = tuple(p.lower() for p in (match.get("tag_prefixes") or []))
+        if not prefixes:
+            raise ValueError(f"team rule {name!r} has no match.tag_prefixes")
+        message = raw.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError(f"team rule {name!r} has empty message")
+        sched_cfg = raw.get("schedule")
+        static_handle = raw.get("handle")
+        schedule: Optional[_Schedule] = None
+        if sched_cfg:
+            bh = sched_cfg.get("business_hours") or {}
+            oh = sched_cfg.get("off_hours") or {}
+            schedule = _Schedule(
+                tz=_parse_tz_offset(bh["tz"]),
+                days=frozenset(_WEEKDAY_BY_NAME[d.lower()] for d in bh["days"]),
+                start=_parse_hhmm(bh["start"]),
+                end=_parse_hhmm(bh["end"]),
+                business_handle=bh["handle"],
+                off_hours_handle=oh["handle"],
+            )
+        elif not (isinstance(static_handle, str) and static_handle.strip()):
+            raise ValueError(f"team rule {name!r} needs either `handle` or `schedule`")
+        rules.append(_Rule(
+            name=name,
+            tag_prefixes=prefixes,
+            message=message.strip(),
+            place_at_top=bool(raw.get("place_at_top", False)),
+            schedule=schedule,
+            static_handle=static_handle if schedule is None else None,
+        ))
+    default_message = data.get("default_message") or "cc {mention}"
+    return _TeamRules(default_message=default_message, rules=tuple(rules))
+
+
+_TEAM_RULES_PATH = os.getenv("TEAM_RULES_CONFIG") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "team_rules.yaml"
+)
+TEAM_RULES = _load_team_rules(_TEAM_RULES_PATH)
+logger.info(
+    "Loaded team rules from %s: %d rule(s)", _TEAM_RULES_PATH, len(TEAM_RULES.rules)
 )
 
 
-def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """Return (Slack user-group handle, mention message template) or None.
+def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str, bool]]:
+    """Return (Slack handle, mention message template, place_at_top) or None.
 
     Resolution order:
-    1. `slack-team` / `slack_team` key in details
-    2. tag formatted as `slack-team:foo` / `slack-team=foo`
-    3. Pingdom-style integration tag (`global-integration-*` or
-       `gb-integration-*`) -> `integration-team` with a partner-integration
-       message instead of the default `cc` line.
+    1. `slack-team` / `slack_team` key in details        -> default_message
+    2. tag `slack-team:foo` / `slack-team=foo`           -> default_message
+    3. First rule in team_rules.yaml whose tag_prefixes match a tag.
     """
     body = (alert or {}).get("body") or {}
     cef = body.get("cef_details") or {}
@@ -159,26 +260,26 @@ def extract_slack_team(alert: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     for key in ("slack-team", "slack_team"):
         v = details.get(key)
         if isinstance(v, str) and v.strip():
-            return v.strip().lstrip("@"), DEFAULT_MENTION_TEMPLATE
+            return v.strip().lstrip("@"), TEAM_RULES.default_message, False
 
     tags = details.get("tags")
-    if isinstance(tags, list):
-        for t in tags:
-            if not isinstance(t, str):
-                continue
-            for sep in (":", "="):
-                if sep in t:
-                    k, v = t.split(sep, 1)
-                    if k.strip().lower() in ("slack-team", "slack_team") and v.strip():
-                        return v.strip().lstrip("@"), DEFAULT_MENTION_TEMPLATE
-                    break
+    if not isinstance(tags, list):
+        return None
 
-        for t in tags:
-            if not isinstance(t, str):
-                continue
-            tl = t.strip().lower()
-            if any(tl.startswith(p) for p in PINGDOM_INTEGRATION_TAG_PREFIXES):
-                return PINGDOM_INTEGRATION_TEAM_HANDLE, INTEGRATION_TEAM_MENTION_TEMPLATE
+    for t in tags:
+        if not isinstance(t, str):
+            continue
+        for sep in (":", "="):
+            if sep in t:
+                k, v = t.split(sep, 1)
+                if k.strip().lower() in ("slack-team", "slack_team") and v.strip():
+                    return v.strip().lstrip("@"), TEAM_RULES.default_message, False
+                break
+
+    str_tags = [t for t in tags if isinstance(t, str)]
+    for rule in TEAM_RULES.rules:
+        if rule.matches(str_tags):
+            return rule.pick_handle(), rule.message, rule.place_at_top
     return None
 
 
@@ -392,11 +493,13 @@ async def pagerduty_webhook(
     team_info = extract_slack_team(alert or {})
 
     slack_message: Optional[str] = None
+    slack_message_at_top = False
     if team_info:
-        handle, template = team_info
+        handle, template, place_at_top = team_info
         group_id = await slack_get_usergroup_id(handle)
         if group_id:
             slack_message = template.format(mention=f"<!subteam^{group_id}>")
+            slack_message_at_top = place_at_top
         else:
             logger.warning(
                 "Could not resolve Slack team handle '%s' to user-group ID (incident=%s)",
@@ -405,6 +508,8 @@ async def pagerduty_webhook(
             )
 
     parts: list[str] = []
+    if slack_message and slack_message_at_top:
+        parts.append(slack_message)
     if check_name:
         parts.append(f"check_name: {check_name}")
     if tags:
@@ -430,7 +535,7 @@ async def pagerduty_webhook(
         parts.append("Links:")
         for text, href in links:
             parts.append(f"- {text}: {href}")
-    if slack_message:
+    if slack_message and not slack_message_at_top:
         parts.append(slack_message)
 
     if parts:
